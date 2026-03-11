@@ -1,36 +1,82 @@
 import logging
-from datetime import datetime
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from config import settings
 from src.agents.classifier import ClassifierAgent
-from src.agents.customer_service import CustomerServiceAgent
-from src.agents.bookkeeper import BookkeeperAgent
-from src.services.llm_client import LLMClient
+from src.agents.consulting import ConsultingAgent
+from src.agents.chatting import ChattingAgent
+from src.agents.purchasing import PurchasingAgent
+from src.llm import LLMFactory
+from src.accounting.sqlite_accounting import SQLiteAccounting
+from src.accounting.notion_accounting import NotionAccounting
+from src.accounting.excel_accounting import ExcelAccounting
+from src.accounting.composite import CompositeAccounting
 from src.services.notion_client import NotionService
 from src.services.excel_exporter import ExcelExporter
 from src.storage.database import Database
-from src.storage.models import Record
 from src.utils.context_manager import ContextManager
+from src.graph.graph import build_graph
+from src.graph.nodes import is_manual_mode
 
 logger = logging.getLogger(__name__)
 
 
 class MessageHandler:
-    """Central message dispatcher: classify intent → route to agent → respond."""
+    """Central message dispatcher: uses LangGraph state machine for routing."""
 
     def __init__(self):
-        self.llm = LLMClient()
-        self.classifier = ClassifierAgent(self.llm)
-        self.customer_service = CustomerServiceAgent(self.llm)
-        self.bookkeeper = BookkeeperAgent(self.llm)
-        self.context = ContextManager()
+        # LLM
+        llm = LLMFactory.create()
+
+        # Agents
+        self.classifier = ClassifierAgent(llm)
+        self.consulting = ConsultingAgent(llm)
+        self.chatting = ChattingAgent(llm)
+        self.purchasing = PurchasingAgent(llm)
+
+        # Storage & services
         self.db = Database()
         self.notion = NotionService()
         self.excel_exporter = ExcelExporter()
+        self.context = ContextManager()
+
+        # Accounting (composite)
+        self.accounting = self._build_accounting()
+
+        # Graph
+        self.graph = build_graph(
+            classifier=self.classifier,
+            consulting_agent=self.consulting,
+            chatting_agent=self.chatting,
+            purchasing_agent=self.purchasing,
+            accounting=self.accounting,
+            admin_chat_id=settings.admin_chat_id or None,
+            confidence_threshold=settings.confidence_threshold,
+        )
+
+    def _build_accounting(self) -> CompositeAccounting:
+        backends = []
+        enabled = [b.strip() for b in settings.accounting_backends.split(",")]
+        if "sqlite" in enabled:
+            backends.append(SQLiteAccounting(self.db))
+        if "notion" in enabled:
+            backends.append(NotionAccounting(self.notion))
+        if "excel" in enabled:
+            backends.append(ExcelAccounting())
+        if not backends:
+            backends.append(SQLiteAccounting(self.db))
+        return CompositeAccounting(backends)
 
     async def init(self) -> None:
         await self.db.init()
+        # Restore manual modes from DB
+        from src.graph.nodes import set_manual_mode
+        modes = await self.db.load_manual_modes()
+        for chat_id, enabled in modes.items():
+            set_manual_mode(chat_id, enabled)
+        if modes:
+            logger.info(f"Restored {len(modes)} manual mode sessions")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message or not update.message.text:
@@ -40,50 +86,57 @@ class MessageHandler:
         user_message = update.message.text.strip()
         logger.info(f"[{chat_id}] Received: {user_message}")
 
-        # Classify intent
-        intent = await self.classifier.classify(user_message)
+        # If in manual mode, forward to admin
+        if is_manual_mode(chat_id) and settings.admin_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=settings.admin_chat_id,
+                    text=f"[User {chat_id}] {user_message}",
+                )
+            except Exception as e:
+                logger.error(f"Failed to forward to admin: {e}")
+            await update.message.reply_text("已收到，正在等待人工客服回复...")
+            self.context.add_message(chat_id, "user", user_message)
+            return
+
         history = self.context.get_history(chat_id)
 
-        if intent == ClassifierAgent.INTENT_BOOKKEEPING:
-            reply = await self._handle_bookkeeping(chat_id, user_message)
-        else:
-            reply = await self.customer_service.handle(user_message, history)
+        # Invoke the LangGraph state machine
+        state = {
+            "chat_id": chat_id,
+            "user_message": user_message,
+            "history": history,
+            "is_manual": False,
+            "intent": None,
+            "confidence": 0.0,
+            "response": "",
+            "extracted_order": None,
+            "order_confirmed": False,
+        }
+
+        result = await self.graph.ainvoke(state)
+        reply = result.get("response", "Sorry, something went wrong.")
+
+        # If auto-escalated to manual, notify admin
+        if result.get("intent") == "manual" and settings.admin_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=settings.admin_chat_id,
+                    text=(
+                        f"🔔 User {chat_id} needs manual assistance.\n"
+                        f"Message: {user_message}\n"
+                        f"Use /takeover {chat_id} to begin."
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin: {e}")
 
         # Update context
         self.context.add_message(chat_id, "user", user_message)
         self.context.add_message(chat_id, "assistant", reply)
 
         await update.message.reply_text(reply)
-        logger.info(f"[{chat_id}] Replied: {reply[:100]}...")
-
-    async def _handle_bookkeeping(self, chat_id: int, user_message: str) -> str:
-        entry = await self.bookkeeper.parse_entry(user_message)
-        if entry is None:
-            return "Sorry, I couldn't parse the entry. Try something like '午饭 30 元'."
-
-        record = Record(
-            chat_id=chat_id,
-            amount=entry.amount,
-            category=entry.category,
-            description=entry.description,
-            entry_type=entry.entry_type,
-            created_at=datetime.now(),
-        )
-
-        # Save to SQLite
-        record_id = await self.db.insert_record(record)
-        logger.info(f"Saved record #{record_id} for chat {chat_id}")
-
-        # Sync to Notion (non-blocking, log errors only)
-        await self.notion.add_record(record)
-
-        type_label = "收入" if entry.entry_type == "income" else "支出"
-        return (
-            f"✅ 已记录{type_label}\n"
-            f"📝 {entry.description}\n"
-            f"💰 ¥{entry.amount:.2f}\n"
-            f"📂 {entry.category}"
-        )
+        logger.info(f"[{chat_id}] Intent: {result.get('intent')} | Replied: {reply[:80]}...")
 
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /export command: export records as Excel file."""
@@ -106,8 +159,10 @@ class MessageHandler:
         await update.message.reply_text(
             "👋 Welcome to Telegram Auto Agent!\n\n"
             "I can help you with:\n"
-            "• 💬 General Q&A - just type your question\n"
-            "• 📒 Quick bookkeeping - e.g. '午饭 30 元'\n"
-            "• 📊 Export records - use /export\n\n"
+            "• 💬 Product consulting - ask about products & pricing\n"
+            "• 🛒 Quick purchasing - say 'I want to buy...'\n"
+            "• 💬 Casual chat - just say hi!\n"
+            "• 📊 Export records - use /export\n"
+            "• 👨‍💼 Human agent - say '转人工'\n\n"
             "Try it now!"
         )

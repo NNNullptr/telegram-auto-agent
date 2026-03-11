@@ -18,6 +18,7 @@ class Database:
     async def init(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
+            # Legacy records table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,6 +28,27 @@ class Database:
                     description TEXT NOT NULL,
                     entry_type TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+            """)
+            # New transactions table for purchase flow
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    product TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    unit_price REAL NOT NULL DEFAULT 0,
+                    total_amount REAL NOT NULL DEFAULT 0,
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            # Chat states for manual mode persistence
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS chat_states (
+                    chat_id INTEGER PRIMARY KEY,
+                    is_manual INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
                 )
             """)
             await db.commit()
@@ -75,3 +97,38 @@ class Database:
                 )
                 for row in rows
             ]
+
+    # --- Manual mode persistence ---
+
+    async def load_manual_modes(self) -> dict[int, bool]:
+        """Load manual mode states from DB (called on startup)."""
+        result = {}
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT chat_id, is_manual FROM chat_states WHERE is_manual = 1"
+                )
+                rows = await cursor.fetchall()
+                for row in rows:
+                    result[row["chat_id"]] = True
+        except Exception as e:
+            logger.error(f"Failed to load manual modes: {e}")
+        return result
+
+    async def save_manual_mode(self, chat_id: int, is_manual: bool) -> None:
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    INSERT INTO chat_states (chat_id, is_manual, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        is_manual = excluded.is_manual,
+                        updated_at = excluded.updated_at
+                    """,
+                    (chat_id, int(is_manual), datetime.now().isoformat()),
+                )
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save manual mode for {chat_id}: {e}")

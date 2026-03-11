@@ -1,8 +1,14 @@
 import logging
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler as TGMessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler as TGMessageHandler,
+    filters,
+)
 
 from config import settings
 from src.handlers.message_handler import MessageHandler
+from src.handlers.admin_handler import AdminHandler
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -24,6 +30,7 @@ def main() -> None:
         return
 
     handler = MessageHandler()
+    admin_handler = AdminHandler()
 
     app = (
         ApplicationBuilder()
@@ -33,10 +40,24 @@ def main() -> None:
     )
     app.bot_data["handler"] = handler
 
-    # Register handlers
+    # Admin commands
+    app.add_handler(CommandHandler("takeover", admin_handler.handle_takeover))
+    app.add_handler(CommandHandler("release", admin_handler.handle_release))
+    app.add_handler(CommandHandler("reply", admin_handler.handle_reply))
+
+    # User commands
     app.add_handler(CommandHandler("start", handler.handle_start))
     app.add_handler(CommandHandler("export", handler.handle_export))
+
+    # Message handler (must be last)
     app.add_handler(TGMessageHandler(filters.TEXT & ~filters.COMMAND, handler.handle_message))
+
+    # Admin group message forwarding (if admin_chat_id is configured)
+    if settings.admin_chat_id:
+        app.add_handler(TGMessageHandler(
+            filters.Chat(settings.admin_chat_id) & filters.TEXT & ~filters.COMMAND,
+            admin_handler.handle_admin_message,
+        ))
 
     logger.info("Bot is starting...")
     app.run_polling()
