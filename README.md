@@ -1,81 +1,110 @@
 # telegram-auto-agent
-An LLM-powered Telegram Agent featuring autonomous customer support and natural language financial tracking.基于 LLM 的 Telegram 智能 Agent，支持自动回复客服消息与自然语言记账功能。
 
-# telegram-auto-agent
+基于 LLM 的 Telegram 智能 Agent，支持自动客服回复与自然语言记账。
 
-一个轻量级的 Telegram 智能 Agent，集成了**自动客服回复**与**随手记账**功能。
+## 功能特性
 
-## 🚀 功能特性
+- **智能客服**：LLM 自动识别用户意图，全天候自动答疑与引导
+- **快捷记账**：自然语言输入（如 "午饭 30 元"）自动提取账目，同步至 SQLite / Notion
+- **上下文记忆**：多轮对话逻辑，Agent 回复更贴合语境
+- **Excel 导出**：使用 `/export` 命令导出账目为 Excel 文件
+- **模块化设计**：支持接入任意 OpenAI 兼容 API（DeepSeek、Ollama、通义千问等）
 
-* **智能客服**：基于 LLM 自动识别用户意图，实现全天候自动答疑与引导。
-* **快捷记账**：通过自然语言输入（如“午饭 30 元”）自动提取账目并同步至数据库/记账系统。
-* **上下文记忆**：支持多轮对话逻辑，使 Agent 回复更贴合语境。
-* **易于扩展**：采用模块化设计，方便接入不同的 AI 模型或第三方 API。
+## 环境准备
 
-## 🛠️ 环境准备
+- Python 3.10+
+- Telegram Bot Token（通过 [@BotFather](https://t.me/botfather) 获取）
+- OpenAI 兼容 API Key
 
-* Python 3.10+
-* WSL2 (Ubuntu/Debian) 环境（推荐）
-* Telegram Bot Token (通过 [@BotFather](https://t.me/botfather) 获取)
-
-## 📦 快速开始
+## 快速开始
 
 ### 1. 克隆仓库
 
 ```bash
 git clone https://github.com/NNNullptr/telegram-auto-agent.git
 cd telegram-auto-agent
-
 ```
 
 ### 2. 安装依赖
 
-建议使用 `conda` 或 `pyenv` 创建独立环境：
-
 ```bash
 pip install -r requirements.txt
-
 ```
 
 ### 3. 配置环境变量
 
-复制 `.env.example` 并重命名为 `.env`，填入你的 API 密钥：
-
-```env
-TELEGRAM_BOT_TOKEN=your_token_here
-LLM_API_KEY=your_api_key_here
-# 其他数据库或记账服务配置
-
+```bash
+cp .env.example .env
+# 编辑 .env 填入你的 Token 和 API Key
 ```
 
-### 4. 启动项目
+### 4. 启动
 
 ```bash
 python main.py
-
 ```
 
-## 📂 项目结构
+### Docker 部署
 
-```text
+```bash
+cp .env.example .env
+# 编辑 .env
+docker compose up -d
+```
+
+## 项目结构
+
+```
+├── main.py                     # 入口文件
+├── config/
+│   └── settings.py             # 配置管理（从 .env 加载）
 ├── src/
-│   ├── agents/          # Agent 逻辑核心
-│   ├── handlers/        # Telegram 消息处理器
-│   ├── services/        # 记账与客服外部服务对接
-│   └── utils/           # 工具函数
-├── config/              # 配置文件
-├── main.py              # 入口文件
-└── requirements.txt
-
+│   ├── agents/                 # Agent 核心逻辑
+│   │   ├── base_agent.py       # Agent 基类
+│   │   ├── classifier.py       # 意图分类器
+│   │   ├── customer_service.py # 客服 Agent
+│   │   └── bookkeeper.py       # 记账 Agent
+│   ├── handlers/
+│   │   └── message_handler.py  # Telegram 消息接收与分发
+│   ├── services/
+│   │   ├── llm_client.py       # OpenAI 兼容 LLM 客户端
+│   │   ├── notion_client.py    # Notion API 集成
+│   │   └── excel_exporter.py   # Excel 导出
+│   ├── storage/
+│   │   ├── models.py           # 数据模型
+│   │   └── database.py         # SQLite 数据库操作
+│   └── utils/
+│       └── context_manager.py  # 多轮对话上下文管理
+├── prompts/                    # Prompt 模板（可热更新）
+│   ├── classifier.txt
+│   ├── customer_service.txt
+│   └── bookkeeper.txt
+├── .env.example                # 环境变量模板
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
 ```
 
-## 📝 TODO
+## Bot 命令
 
-* [ ] 支持多端账单同步（如 Notion/Excel）
-* [ ] 优化客服知识库匹配精度
+| 命令 | 说明 |
+|------|------|
+| `/start` | 查看欢迎信息和使用说明 |
+| `/export` | 导出记账记录为 Excel |
+| 自然语言 | 自动识别为客服问答或记账 |
 
-## 📄 开源协议
+## 配置说明
 
-本项目遵循 [MIT License](https://www.google.com/search?q=LICENSE)。
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | (必填) |
+| `LLM_API_KEY` | LLM API Key | (必填) |
+| `LLM_BASE_URL` | API 地址 | `https://api.openai.com/v1` |
+| `LLM_MODEL_NAME` | 模型名称 | `gpt-4o-mini` |
+| `NOTION_ENABLED` | 启用 Notion 同步 | `false` |
+| `NOTION_API_KEY` | Notion API Key | - |
+| `NOTION_DATABASE_ID` | Notion 数据库 ID | - |
 
----
+## 开源协议
+
+[MIT License](LICENSE)
