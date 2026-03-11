@@ -72,7 +72,6 @@ python main.py
 ## 📝 TODO
 
 * [ ] 支持多端账单同步（如 Notion/Excel）
-* [ ] 增加图片账单 OCR 识别
 * [ ] 优化客服知识库匹配精度
 
 ## 📄 开源协议
