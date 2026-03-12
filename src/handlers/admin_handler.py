@@ -1,10 +1,12 @@
 """Admin takeover handler — simplified Reply-based forwarding.
 
 Flow:
-  1. User messages in manual mode are forwarded to ADMIN_ID
-  2. Admin replies (Reply) to the forwarded message → bot sends reply back to user
-  3. /takeover <chat_id> — manually activate manual mode
-  4. /release <chat_id> — deactivate manual mode, switch back to AI
+  1. 订单确认后 → 用户自动进入 manual 模式
+  2. manual 模式下用户消息以文本方式发给 admin（格式：💬 [用户 xxx]\n消息）
+  3. admin 直接 Reply 这条消息 → bot 根据 forwarded_map 找到原用户并回传
+  4. /takeover <chat_id> — 手动接管
+  5. /release <chat_id> — 释放，切回 AI
+  6. /reply <chat_id> <消息> — 手动回复（Reply 不可用时的备选）
 """
 
 import logging
@@ -70,35 +72,32 @@ async def handle_release(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin replies to a forwarded message → bot sends the reply to the original user.
+    """Admin Reply 被转发的消息 → bot 发回给原用户。
 
-    This works because in manual mode we use `forward_message` to forward the user's
-    message to admin. When admin uses Telegram's Reply feature on that forwarded
-    message, `reply_to_message.forward_origin` contains the original sender info.
+    使用 MessageHandler.forwarded_map 查找 reply_to_message.message_id → user chat_id。
     """
     msg = update.message
-    if not msg or not msg.reply_to_message:
+    if not msg or not msg.reply_to_message or not msg.text:
         return
     if not _is_admin(update.effective_user.id):
         return
 
     replied_to = msg.reply_to_message
+    replied_id = replied_to.message_id
 
-    # Extract the original user's chat_id from the forwarded message
-    target_chat_id = None
+    # 从 forwarded_map 查找原用户
+    handler = context.application.bot_data.get("handler")
+    if not handler:
+        return
 
-    # python-telegram-bot v20+: forward_origin (Bot API 7.0+)
-    if hasattr(replied_to, "forward_origin") and replied_to.forward_origin:
-        origin = replied_to.forward_origin
-        # MessageOriginUser has a .sender_user
-        if hasattr(origin, "sender_user") and origin.sender_user:
-            target_chat_id = origin.sender_user.id
-    # Fallback: legacy forward_from field
-    elif replied_to.forward_from:
-        target_chat_id = replied_to.forward_from.id
+    target_chat_id = handler.forwarded_map.get(replied_id)
+
+    # Fallback: 尝试从消息文本 "💬 [用户 xxx]" 中解析
+    if not target_chat_id and replied_to.text:
+        target_chat_id = _parse_chat_id_from_text(replied_to.text)
 
     if not target_chat_id:
-        await msg.reply_text("⚠️ 无法识别原始用户，请用 /reply <chat_id> <消息> 手动回复。")
+        await msg.reply_text("⚠️ 无法识别原用户。请用 /reply <chat_id> <消息> 手动回复。")
         return
 
     try:
@@ -109,8 +108,19 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text(f"❌ 发送失败：{e}")
 
 
+def _parse_chat_id_from_text(text: str) -> int | None:
+    """从 '💬 [用户 123456]\nxxx' 格式中提取 chat_id。"""
+    try:
+        if "[用户 " in text:
+            part = text.split("[用户 ")[1].split("]")[0]
+            return int(part)
+    except (IndexError, ValueError):
+        pass
+    return None
+
+
 async def handle_manual_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/reply <chat_id> <message> — fallback when Reply doesn't work."""
+    """/reply <chat_id> <message> — Reply 不可用时的手动备选。"""
     if not _is_admin(update.effective_user.id):
         return
 
