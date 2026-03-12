@@ -1,3 +1,4 @@
+'''配置管理，从.env加载'''
 from pydantic_settings import BaseSettings
 from pydantic import Field
 

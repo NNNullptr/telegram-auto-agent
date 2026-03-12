@@ -1,4 +1,4 @@
-正在完善中，还不能用。。。
+正在完善中
 # telegram-auto-agent
 
 基于 LLM 的 Telegram 智能 Agent，支持自动客服回复与自然语言记账。
@@ -6,7 +6,7 @@
 ## 功能特性
 
 - **智能客服**：LLM 自动识别用户意图，全天候自动答疑与引导
-- **快捷记账**：自然语言输入（如 "午饭 30 元"）自动提取账目，同步至 SQLite / Notion
+- **快捷记账**：自动提取账目，同步至 SQLite / Notion
 - **上下文记忆**：多轮对话逻辑，Agent 回复更贴合语境
 - **Excel 导出**：使用 `/export` 命令导出账目为 Excel 文件
 - **模块化设计**：支持接入任意 OpenAI 兼容 API（DeepSeek、Ollama、通义千问等）
@@ -51,39 +51,6 @@ python main.py
 cp .env.example .env
 # 编辑 .env
 docker compose up -d
-```
-
-## 项目结构
-
-```
-├── main.py                     # 入口文件
-├── config/
-│   └── settings.py             # 配置管理（从 .env 加载）
-├── src/
-│   ├── agents/                 # Agent 核心逻辑
-│   │   ├── base_agent.py       # Agent 基类
-│   │   ├── classifier.py       # 意图分类器
-│   │   ├── customer_service.py # 客服 Agent
-│   │   └── bookkeeper.py       # 记账 Agent
-│   ├── handlers/
-│   │   └── message_handler.py  # Telegram 消息接收与分发
-│   ├── services/
-│   │   ├── llm_client.py       # OpenAI 兼容 LLM 客户端
-│   │   ├── notion_client.py    # Notion API 集成
-│   │   └── excel_exporter.py   # Excel 导出
-│   ├── storage/
-│   │   ├── models.py           # 数据模型
-│   │   └── database.py         # SQLite 数据库操作
-│   └── utils/
-│       └── context_manager.py  # 多轮对话上下文管理
-├── prompts/                    # Prompt 模板（可热更新）
-│   ├── classifier.txt
-│   ├── customer_service.txt
-│   └── bookkeeper.txt
-├── .env.example                # 环境变量模板
-├── requirements.txt
-├── Dockerfile
-└── docker-compose.yml
 ```
 
 ## Bot 命令
