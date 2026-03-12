@@ -17,7 +17,7 @@ from src.services.excel_exporter import ExcelExporter
 from src.storage.database import Database
 from src.utils.context_manager import ContextManager
 from src.graph.graph import build_graph
-from src.graph.nodes import is_manual_mode
+from src.graph.nodes import is_manual_mode, set_manual_mode
 
 logger = logging.getLogger(__name__)
 
@@ -26,32 +26,26 @@ class MessageHandler:
     """Central message dispatcher: uses LangGraph state machine for routing."""
 
     def __init__(self):
-        # LLM
         llm = LLMFactory.create()
 
-        # Agents
         self.classifier = ClassifierAgent(llm)
         self.consulting = ConsultingAgent(llm)
         self.chatting = ChattingAgent(llm)
         self.purchasing = PurchasingAgent(llm)
 
-        # Storage & services
         self.db = Database()
         self.notion = NotionService()
         self.excel_exporter = ExcelExporter()
         self.context = ContextManager()
-
-        # Accounting (composite)
         self.accounting = self._build_accounting()
 
-        # Graph
         self.graph = build_graph(
             classifier=self.classifier,
             consulting_agent=self.consulting,
             chatting_agent=self.chatting,
             purchasing_agent=self.purchasing,
             accounting=self.accounting,
-            admin_chat_id=settings.admin_chat_id or None,
+            admin_chat_id=settings.admin_id or None,
             confidence_threshold=settings.confidence_threshold,
         )
 
@@ -70,8 +64,6 @@ class MessageHandler:
 
     async def init(self) -> None:
         await self.db.init()
-        # Restore manual modes from DB
-        from src.graph.nodes import set_manual_mode
         modes = await self.db.load_manual_modes()
         for chat_id, enabled in modes.items():
             set_manual_mode(chat_id, enabled)
@@ -86,22 +78,18 @@ class MessageHandler:
         user_message = update.message.text.strip()
         logger.info(f"[{chat_id}] Received: {user_message}")
 
-        # If in manual mode, forward to admin
-        if is_manual_mode(chat_id) and settings.admin_chat_id:
+        # ── Manual mode: forward original message to admin (so admin can Reply) ──
+        if is_manual_mode(chat_id) and settings.admin_id:
             try:
-                await context.bot.send_message(
-                    chat_id=settings.admin_chat_id,
-                    text=f"[User {chat_id}] {user_message}",
-                )
+                await update.message.forward(chat_id=settings.admin_id)
             except Exception as e:
                 logger.error(f"Failed to forward to admin: {e}")
-            await update.message.reply_text("已收到，正在等待人工客服回复...")
+            await update.message.reply_text("已收到，正在等待人工回复...")
             self.context.add_message(chat_id, "user", user_message)
             return
 
+        # ── Normal mode: invoke LangGraph ──
         history = self.context.get_history(chat_id)
-
-        # Invoke the LangGraph state machine
         state = {
             "chat_id": chat_id,
             "user_message": user_message,
@@ -117,36 +105,67 @@ class MessageHandler:
         result = await self.graph.ainvoke(state)
         reply = result.get("response", "Sorry, something went wrong.")
 
-        # If auto-escalated to manual, notify admin
-        if result.get("intent") == "manual" and settings.admin_chat_id:
+        # ── If auto-escalated to manual, notify admin ──
+        if result.get("intent") == "manual" and settings.admin_id:
             try:
                 await context.bot.send_message(
-                    chat_id=settings.admin_chat_id,
+                    chat_id=settings.admin_id,
                     text=(
-                        f"🔔 User {chat_id} needs manual assistance.\n"
-                        f"Message: {user_message}\n"
-                        f"Use /takeover {chat_id} to begin."
+                        f"🔔 用户 {chat_id} 请求人工帮助\n"
+                        f"消息：{user_message}\n"
+                        f"使用 /takeover {chat_id} 接管\n"
+                        f"使用 /release {chat_id} 释放"
                     ),
                 )
             except Exception as e:
                 logger.error(f"Failed to notify admin: {e}")
 
-        # Update context
+        # ── Order confirmed → send details to admin + enter manual mode ──
+        order = result.get("extracted_order")
+        if order and result.get("order_confirmed"):
+            await self._notify_order_and_enter_manual(chat_id, order, context)
+
         self.context.add_message(chat_id, "user", user_message)
         self.context.add_message(chat_id, "assistant", reply)
 
         await update.message.reply_text(reply)
         logger.info(f"[{chat_id}] Intent: {result.get('intent')} | Replied: {reply[:80]}...")
 
+    async def _notify_order_and_enter_manual(
+        self, chat_id: int, order: dict, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Send order details to admin and switch the user to manual mode."""
+        if not settings.admin_id:
+            return
+
+        order_text = (
+            f"🛒 新订单！\n"
+            f"👤 用户：{chat_id}\n"
+            f"📦 商品：{order.get('product', '?')}\n"
+            f"🔢 数量：{order.get('quantity', '?')}\n"
+            f"💰 单价：¥{order.get('unit_price', 0):.2f}\n"
+            f"💵 总计：¥{order.get('total_amount', 0):.2f}\n\n"
+            f"该用户已自动进入人工模式。\n"
+            f"用户后续消息会转发给您，直接回复(Reply)即可。\n"
+            f"完成后使用 /release {chat_id} 切回 AI。"
+        )
+
+        try:
+            await context.bot.send_message(chat_id=settings.admin_id, text=order_text)
+        except Exception as e:
+            logger.error(f"Failed to send order to admin: {e}")
+
+        # Auto-enter manual mode
+        set_manual_mode(chat_id, True)
+        await self.db.save_manual_mode(chat_id, True)
+        logger.info(f"[{chat_id}] Auto-entered manual mode after order confirmation")
+
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /export command: export records as Excel file."""
         chat_id = update.effective_chat.id
         records = await self.db.get_records(chat_id)
-
         if not records:
             await update.message.reply_text("No records found.")
             return
-
         excel_file = self.excel_exporter.export(records)
         await update.message.reply_document(
             document=excel_file,
@@ -155,14 +174,11 @@ class MessageHandler:
         )
 
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command."""
         await update.message.reply_text(
-            "👋 Welcome to Telegram Auto Agent!\n\n"
-            "I can help you with:\n"
-            "• 💬 Product consulting - ask about products & pricing\n"
-            "• 🛒 Quick purchasing - say 'I want to buy...'\n"
-            "• 💬 Casual chat - just say hi!\n"
-            "• 📊 Export records - use /export\n"
-            "• 👨‍💼 Human agent - say '转人工'\n\n"
-            "Try it now!"
+            "👋 Welcome!\n\n"
+            "• 💬 咨询商品 — 直接提问\n"
+            "• 🛒 购买下单 — 说「我要买...」\n"
+            "• 💬 闲聊 — 随便聊\n"
+            "• 👨‍💼 转人工 — 说「转人工」\n"
+            "• 📊 导出账单 — /export"
         )

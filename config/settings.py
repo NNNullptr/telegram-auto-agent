@@ -23,8 +23,8 @@ class Settings(BaseSettings):
     context_expire_minutes: int = Field(default=30)
 
     # Admin / Manual takeover
-    admin_chat_id: int = Field(default=0)
-    admin_user_ids: list[int] = Field(default_factory=list)
+    # 管理员的 Telegram user ID，同时用作接收通知的 chat_id 和授权 ID
+    admin_id: int = Field(default=0)
     confidence_threshold: float = Field(default=0.6)
 
     # Accounting backends (comma-separated: sqlite,notion,excel)

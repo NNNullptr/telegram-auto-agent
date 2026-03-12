@@ -1,135 +1,133 @@
-"""Admin takeover handler — /takeover, /release, /reply commands."""
+"""Admin takeover handler — simplified Reply-based forwarding.
+
+Flow:
+  1. User messages in manual mode are forwarded to ADMIN_ID
+  2. Admin replies (Reply) to the forwarded message → bot sends reply back to user
+  3. /takeover <chat_id> — manually activate manual mode
+  4. /release <chat_id> — deactivate manual mode, switch back to AI
+"""
 
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import settings
-from src.graph.nodes import is_manual_mode, set_manual_mode
+from src.graph.nodes import set_manual_mode
 
 logger = logging.getLogger(__name__)
 
 
-class AdminHandler:
-    """Handles admin commands for manual takeover of user conversations."""
+def _is_admin(user_id: int) -> bool:
+    return user_id == settings.admin_id
 
-    def _is_admin(self, user_id: int) -> bool:
-        return user_id in settings.admin_user_ids
 
-    async def handle_takeover(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin command: /takeover <chat_id>"""
-        user_id = update.effective_user.id
-        if not self._is_admin(user_id):
-            await update.message.reply_text("Unauthorized.")
-            return
+async def handle_takeover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/takeover <chat_id>"""
+    if not _is_admin(update.effective_user.id):
+        return
 
-        args = context.args
-        if not args:
-            await update.message.reply_text("Usage: /takeover <chat_id>")
-            return
+    if not context.args:
+        await update.message.reply_text("用法：/takeover <chat_id>")
+        return
 
-        try:
-            target_chat_id = int(args[0])
-        except ValueError:
-            await update.message.reply_text("Invalid chat_id.")
-            return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("chat_id 无效")
+        return
 
-        set_manual_mode(target_chat_id, True)
-        await update.message.reply_text(f"Takeover activated for chat {target_chat_id}.")
+    set_manual_mode(target, True)
+    await update.message.reply_text(f"✅ 已接管用户 {target}，用户消息会转发给你。")
 
-        # Notify the user
-        try:
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text="您好！人工客服已上线，请继续描述您的问题。",
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify user {target_chat_id}: {e}")
+    try:
+        await context.bot.send_message(chat_id=target, text="您好，人工客服已上线！")
+    except Exception as e:
+        logger.error(f"Failed to notify user {target}: {e}")
 
-    async def handle_release(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin command: /release <chat_id>"""
-        user_id = update.effective_user.id
-        if not self._is_admin(user_id):
-            await update.message.reply_text("Unauthorized.")
-            return
 
-        args = context.args
-        if not args:
-            await update.message.reply_text("Usage: /release <chat_id>")
-            return
+async def handle_release(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/release <chat_id>"""
+    if not _is_admin(update.effective_user.id):
+        return
 
-        try:
-            target_chat_id = int(args[0])
-        except ValueError:
-            await update.message.reply_text("Invalid chat_id.")
-            return
+    if not context.args:
+        await update.message.reply_text("用法：/release <chat_id>")
+        return
 
-        set_manual_mode(target_chat_id, False)
-        await update.message.reply_text(f"Released chat {target_chat_id} back to AI mode.")
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("chat_id 无效")
+        return
 
-        try:
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text="人工客服已结束，AI 助手继续为您服务！",
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify user {target_chat_id}: {e}")
+    set_manual_mode(target, False)
+    await update.message.reply_text(f"✅ 已释放用户 {target}，切回 AI 模式。")
 
-    async def handle_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin command: /reply <chat_id> <message>"""
-        user_id = update.effective_user.id
-        if not self._is_admin(user_id):
-            await update.message.reply_text("Unauthorized.")
-            return
+    try:
+        await context.bot.send_message(chat_id=target, text="人工客服已结束，AI 助手继续为您服务！")
+    except Exception as e:
+        logger.error(f"Failed to notify user {target}: {e}")
 
-        args = context.args
-        if not args or len(args) < 2:
-            await update.message.reply_text("Usage: /reply <chat_id> <message>")
-            return
 
-        try:
-            target_chat_id = int(args[0])
-        except ValueError:
-            await update.message.reply_text("Invalid chat_id.")
-            return
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin replies to a forwarded message → bot sends the reply to the original user.
 
-        message_text = " ".join(args[1:])
+    This works because in manual mode we use `forward_message` to forward the user's
+    message to admin. When admin uses Telegram's Reply feature on that forwarded
+    message, `reply_to_message.forward_origin` contains the original sender info.
+    """
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    if not _is_admin(update.effective_user.id):
+        return
 
-        try:
-            await context.bot.send_message(chat_id=target_chat_id, text=message_text)
-            await update.message.reply_text(f"Message sent to {target_chat_id}.")
-        except Exception as e:
-            logger.error(f"Failed to send reply to {target_chat_id}: {e}")
-            await update.message.reply_text(f"Failed to send: {e}")
+    replied_to = msg.reply_to_message
 
-    async def handle_admin_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle messages in the admin group — forward to manual-mode users.
+    # Extract the original user's chat_id from the forwarded message
+    target_chat_id = None
 
-        This is for messages sent directly in the admin chat (not via /reply).
-        Only processes replies to forwarded user messages.
-        """
-        if not update.message or not update.message.reply_to_message:
-            return
+    # python-telegram-bot v20+: forward_origin (Bot API 7.0+)
+    if hasattr(replied_to, "forward_origin") and replied_to.forward_origin:
+        origin = replied_to.forward_origin
+        # MessageOriginUser has a .sender_user
+        if hasattr(origin, "sender_user") and origin.sender_user:
+            target_chat_id = origin.sender_user.id
+    # Fallback: legacy forward_from field
+    elif replied_to.forward_from:
+        target_chat_id = replied_to.forward_from.id
 
-        user_id = update.effective_user.id
-        if not self._is_admin(user_id):
-            return
+    if not target_chat_id:
+        await msg.reply_text("⚠️ 无法识别原始用户，请用 /reply <chat_id> <消息> 手动回复。")
+        return
 
-        # Try to extract the target chat_id from the replied-to message
-        original = update.message.reply_to_message.text or ""
-        if not original.startswith("[User "):
-            return
+    try:
+        await context.bot.send_message(chat_id=target_chat_id, text=msg.text)
+        await msg.reply_text(f"✅ 已发送给用户 {target_chat_id}")
+    except Exception as e:
+        logger.error(f"Failed to reply to user {target_chat_id}: {e}")
+        await msg.reply_text(f"❌ 发送失败：{e}")
 
-        try:
-            chat_id_str = original.split("]")[0].replace("[User ", "")
-            target_chat_id = int(chat_id_str)
-        except (ValueError, IndexError):
-            return
 
-        try:
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=update.message.text,
-            )
-        except Exception as e:
-            logger.error(f"Failed to forward admin reply to {target_chat_id}: {e}")
+async def handle_manual_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reply <chat_id> <message> — fallback when Reply doesn't work."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text("用法：/reply <chat_id> <消息>")
+        return
+
+    try:
+        target = int(args[0])
+    except ValueError:
+        await update.message.reply_text("chat_id 无效")
+        return
+
+    text = " ".join(args[1:])
+    try:
+        await context.bot.send_message(chat_id=target, text=text)
+        await update.message.reply_text(f"✅ 已发送给 {target}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 发送失败：{e}")
