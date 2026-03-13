@@ -112,6 +112,12 @@ class MessageHandler:
 
         result = await self.graph.ainvoke(state)
         reply = result.get("response", "Sorry, something went wrong.")
+        confirmed_order = result.get("extracted_order")
+
+        # NOTE: Graph-based confirmation path doesn't go through _confirm_order.
+        # We still need to notify admin and enter manual mode here.
+        if result.get("order_confirmed") and confirmed_order:
+            await self._notify_admin_and_enter_manual(chat_id, confirmed_order, context)
 
         # 如果自动升级到 manual，通知 admin
         if result.get("intent") == "manual" and settings.admin_id:
@@ -202,6 +208,15 @@ class MessageHandler:
         await update.message.reply_text(reply)
 
         # 3. 通知 admin + 进入 manual 模式
+        await self._notify_admin_and_enter_manual(chat_id, order, context)
+
+    async def _notify_admin_and_enter_manual(
+        self,
+        chat_id: int,
+        order: dict,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Notify admin about a confirmed order and enter manual mode."""
         if settings.admin_id:
             order_text = (
                 f"🛒 新订单！\n"
@@ -257,10 +272,24 @@ class MessageHandler:
 
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /export — 导出订单交易记录为 Excel 文件。"""
-        chat_id = update.effective_chat.id
+        # 权限控制：仅管理员可导出账单
+        if update.effective_user.id != settings.admin_id:
+            await update.message.reply_text("仅管理员可导出账单。")
+            return
+
+        # 功能备注：管理员通过 /export <chat_id> 导出指定客户账单
+        if not context.args:
+            await update.message.reply_text("用法：/export <chat_id>")
+            return
+
+        try:
+            target_chat_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("chat_id 无效。")
+            return
 
         # 从 transactions 表导出
-        transactions = await self.accounting.get_transactions(chat_id)
+        transactions = await self.accounting.get_transactions(target_chat_id)
         if not transactions:
             await update.message.reply_text("暂无交易记录。")
             return
@@ -295,7 +324,7 @@ class MessageHandler:
 
         await update.message.reply_document(
             document=output,
-            filename=f"transactions_{chat_id}.xlsx",
+            filename=f"transactions_{target_chat_id}.xlsx",
             caption=f"已导出 {len(transactions)} 条交易记录。",
         )
 
