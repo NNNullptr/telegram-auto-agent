@@ -31,6 +31,7 @@ class Database:
                 )
             """)
             # New transactions table for purchase flow
+            # [修改] 新增 customer_name 列：存储下单客户的名称
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,6 +40,7 @@ class Database:
                     quantity INTEGER NOT NULL DEFAULT 1,
                     unit_price REAL NOT NULL DEFAULT 0,
                     total_amount REAL NOT NULL DEFAULT 0,
+                    customer_name TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 )
@@ -51,6 +53,14 @@ class Database:
                     updated_at TEXT NOT NULL
                 )
             """)
+            # [新增] 兼容旧数据库：如果 transactions 表已存在但缺少 customer_name 列，自动添加
+            try:
+                await db.execute(
+                    "ALTER TABLE transactions ADD COLUMN customer_name TEXT NOT NULL DEFAULT ''"
+                )
+            except Exception:
+                pass  # 列已存在则忽略
+
             await db.commit()
         logger.info(f"Database initialized at {self.db_path}")
 

@@ -1,6 +1,8 @@
 import logging
+from io import BytesIO
 from telegram import Update
 from telegram.ext import ContextTypes
+from openpyxl import Workbook
 
 from config import settings
 from src.agents.classifier import ClassifierAgent
@@ -149,7 +151,6 @@ class MessageHandler:
         msg_lower = user_message.strip().lower()
         if not any(kw in msg_lower for kw in _CONFIRM_KEYWORDS):
             return None
-        # 从历史中找最后一条包含「确认订单」的 assistant 消息
         for msg in reversed(history):
             if msg.get("role") == "assistant" and "确认订单" in msg.get("content", ""):
                 return self._parse_order_from_confirmation(msg["content"])
@@ -157,11 +158,17 @@ class MessageHandler:
 
     @staticmethod
     def _parse_order_from_confirmation(content: str) -> dict | None:
-        """从确认消息文本中解析订单信息。"""
+        """从确认消息文本中解析订单信息。
+
+        [修改] 新增解析 '客户：' 行以提取 customer_name。
+        """
         try:
             order = {}
             for line in content.split("\n"):
-                if "商品：" in line:
+                # [新增] 解析客户名称
+                if "客户：" in line:
+                    order["customer_name"] = line.split("客户：")[1].strip()
+                elif "商品：" in line:
                     order["product"] = line.split("商品：")[1].strip()
                 elif "数量：" in line:
                     order["quantity"] = int(line.split("数量：")[1].strip())
@@ -184,7 +191,10 @@ class MessageHandler:
         chat_id: int,
         order: dict,
     ) -> None:
-        """处理订单确认：记录交易 → 通知 admin → 进入 manual 模式。"""
+        """处理订单确认：记录交易 → 通知 admin → 进入 manual 模式。
+
+        [修改] Transaction 新增 customer_name 字段。
+        """
         # 1. 记录交易到数据库
         transaction = Transaction(
             chat_id=chat_id,
@@ -192,14 +202,18 @@ class MessageHandler:
             quantity=order.get("quantity", 1),
             unit_price=order.get("unit_price", 0),
             total_amount=order.get("total_amount", 0),
+            # [新增] 记录客户名称
+            customer_name=order.get("customer_name", ""),
         )
         record_id = await self.accounting.record_transaction(transaction)
         logger.info(f"[{chat_id}] Transaction recorded: {record_id}")
 
-        # 2. 回复用户
+        # 2. 回复用户（[修改] 增加客户名称显示）
+        customer = order.get("customer_name", "")
         reply = (
             f"✅ 订单已确认！\n"
-            f"📦 {order['product']} x{order.get('quantity', 1)}\n"
+            + (f"👤 客户：{customer}\n" if customer else "")
+            + f"📦 {order['product']} x{order.get('quantity', 1)}\n"
             f"💰 总计 ¥{order['total_amount']:.2f}\n"
             f"正在为您转接人工客服确认详情..."
         )
@@ -216,11 +230,16 @@ class MessageHandler:
         order: dict,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Notify admin about a confirmed order and enter manual mode."""
+        """Notify admin about a confirmed order and enter manual mode.
+
+        [修改] 通知消息中增加客户名称显示。
+        """
         if settings.admin_id:
+            customer = order.get("customer_name", "未提供")
             order_text = (
                 f"🛒 新订单！\n"
-                f"👤 用户 ID：{chat_id}\n"
+                f"👤 客户名称：{customer}\n"
+                f"🆔 用户 ID：{chat_id}\n"
                 f"📦 商品：{order.get('product', '?')}\n"
                 f"🔢 数量：{order.get('quantity', '?')}\n"
                 f"💰 单价：¥{order.get('unit_price', 0):.2f}\n"
@@ -247,19 +266,13 @@ class MessageHandler:
         user_message: str,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """manual 模式下转发用户消息给 admin。
-
-        不使用 forward_message（会被用户隐私设置阻断），
-        而是发送纯文本 + 记录 message_id → chat_id 映射。
-        """
+        """manual 模式下转发用户消息给 admin。"""
         text = f"💬 [用户 {chat_id}]\n{user_message}"
         try:
             sent = await context.bot.send_message(
                 chat_id=settings.admin_id, text=text
             )
-            # 记录映射：admin 收到的消息 ID → 原用户 chat_id
             self.forwarded_map[sent.message_id] = chat_id
-            # 保留最近 500 条映射，防止内存泄漏
             if len(self.forwarded_map) > 500:
                 oldest_keys = list(self.forwarded_map.keys())[:-500]
                 for k in oldest_keys:
@@ -271,13 +284,15 @@ class MessageHandler:
         await update.message.reply_text("已收到，正在等待人工回复...")
 
     async def handle_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /export — 导出订单交易记录为 Excel 文件。"""
-        # 权限控制：仅管理员可导出账单
+        """Handle /export — 仅管理员可用，导出指定客户的交易记录。
+
+        用法：/export <chat_id>
+        [修改] 表格新增"客户名称"列。
+        """
         if update.effective_user.id != settings.admin_id:
             await update.message.reply_text("仅管理员可导出账单。")
             return
 
-        # 功能备注：管理员通过 /export <chat_id> 导出指定客户账单
         if not context.args:
             await update.message.reply_text("用法：/export <chat_id>")
             return
@@ -288,31 +303,92 @@ class MessageHandler:
             await update.message.reply_text("chat_id 无效。")
             return
 
-        # 从 transactions 表导出
         transactions = await self.accounting.get_transactions(target_chat_id)
         if not transactions:
             await update.message.reply_text("暂无交易记录。")
             return
 
-        from io import BytesIO
-        from openpyxl import Workbook
+        output = self._build_excel(transactions, include_chat_id=False)
+        await update.message.reply_document(
+            document=output,
+            filename=f"transactions_{target_chat_id}.xlsx",
+            caption=f"已导出 {len(transactions)} 条交易记录。",
+        )
 
+    # [新增] /exportall 命令：导出所有客户的交易记录，表格增加"客户ID"列用于区分
+    async def handle_export_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /exportall — 仅管理员可用，一次导出所有客户的交易记录。
+
+        导出的 Excel 表格包含"客户ID"列，方便区分不同客户。
+        """
+        if update.effective_user.id != settings.admin_id:
+            await update.message.reply_text("仅管理员可导出账单。")
+            return
+
+        # [说明] 从 SQLiteAccounting 获取全部交易记录
+        sqlite_backend = None
+        for backend in self.accounting.backends:
+            if isinstance(backend, SQLiteAccounting):
+                sqlite_backend = backend
+                break
+
+        if not sqlite_backend:
+            await update.message.reply_text("SQLite 后端未启用，无法导出。")
+            return
+
+        transactions = await sqlite_backend.get_all_transactions()
+        if not transactions:
+            await update.message.reply_text("暂无任何交易记录。")
+            return
+
+        # [说明] include_chat_id=True 会在表格第一列插入"客户ID"
+        output = self._build_excel(transactions, include_chat_id=True)
+        await update.message.reply_document(
+            document=output,
+            filename="all_transactions.xlsx",
+            caption=f"已导出全部 {len(transactions)} 条交易记录。",
+        )
+
+    @staticmethod
+    def _build_excel(transactions: list[Transaction], include_chat_id: bool = False) -> BytesIO:
+        """[新增] 通用 Excel 生成工具方法。
+
+        Args:
+            transactions: 交易记录列表
+            include_chat_id: 是否在第一列插入"客户ID"（/exportall 时为 True）
+        """
         wb = Workbook()
         ws = wb.active
         ws.title = "Transactions"
 
-        headers = ["日期", "商品", "数量", "单价", "总计", "备注"]
+        # [修改] 表头增加"客户名称"列；include_chat_id 时增加"客户ID"列
+        if include_chat_id:
+            headers = ["客户ID", "客户名称", "日期", "商品", "数量", "单价", "总计", "备注"]
+        else:
+            headers = ["客户名称", "日期", "商品", "数量", "单价", "总计", "备注"]
+
         for col, h in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=h)
             cell.font = cell.font.copy(bold=True)
 
         for i, t in enumerate(transactions, 2):
-            ws.cell(row=i, column=1, value=t.created_at.strftime("%Y-%m-%d %H:%M"))
-            ws.cell(row=i, column=2, value=t.product)
-            ws.cell(row=i, column=3, value=t.quantity)
-            ws.cell(row=i, column=4, value=t.unit_price)
-            ws.cell(row=i, column=5, value=t.total_amount)
-            ws.cell(row=i, column=6, value=t.description)
+            col = 1
+            if include_chat_id:
+                ws.cell(row=i, column=col, value=t.chat_id)
+                col += 1
+            ws.cell(row=i, column=col, value=t.customer_name or "")
+            col += 1
+            ws.cell(row=i, column=col, value=t.created_at.strftime("%Y-%m-%d %H:%M"))
+            col += 1
+            ws.cell(row=i, column=col, value=t.product)
+            col += 1
+            ws.cell(row=i, column=col, value=t.quantity)
+            col += 1
+            ws.cell(row=i, column=col, value=t.unit_price)
+            col += 1
+            ws.cell(row=i, column=col, value=t.total_amount)
+            col += 1
+            ws.cell(row=i, column=col, value=t.description)
 
         for col in ws.columns:
             max_len = max(len(str(cell.value or "")) for cell in col)
@@ -321,12 +397,7 @@ class MessageHandler:
         output = BytesIO()
         wb.save(output)
         output.seek(0)
-
-        await update.message.reply_document(
-            document=output,
-            filename=f"transactions_{target_chat_id}.xlsx",
-            caption=f"已导出 {len(transactions)} 条交易记录。",
-        )
+        return output
 
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
@@ -335,5 +406,6 @@ class MessageHandler:
             "• 🛒 购买下单 — 说「我要买...」\n"
             "• 💬 闲聊 — 随便聊\n"
             "• 👨‍💼 转人工 — 说「转人工」\n"
-            "• 📊 导出账单 — /export"
+            "• 📊 导出账单 — /export <chat_id>\n"
+            "• 📊 导出全部 — /exportall"
         )

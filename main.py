@@ -46,6 +46,8 @@ def main() -> None:
     # User commands
     app.add_handler(CommandHandler("start", handler.handle_start))
     app.add_handler(CommandHandler("export", handler.handle_export))
+    # [新增] /exportall — 管理员导出所有客户的交易记录（含客户ID列）
+    app.add_handler(CommandHandler("exportall", handler.handle_export_all))
 
     # Admin reply handler: when admin replies to a forwarded message in private chat
     # This must be registered BEFORE the general text handler

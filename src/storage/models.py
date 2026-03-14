@@ -25,6 +25,8 @@ class Transaction(BaseModel):
     quantity: int = 1
     unit_price: float = 0.0
     total_amount: float = 0.0
+    # [新增] 客户名称：下单时由用户提供或 bot 询问后填入
+    customer_name: str = ""
     description: str = ""
     created_at: datetime = PydanticField(default_factory=datetime.now)
     id: int | None = None

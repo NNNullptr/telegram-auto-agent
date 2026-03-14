@@ -61,10 +61,11 @@ docker compose up -d
 | 命令 | 说明 |
 |------|------|
 | `/start` | 查看欢迎信息和使用说明 |
-| `/export` | 导出记账记录为 Excel |
-| takeover <chat_id>	手动接管某用户对话 |
-| release <chat_id>	释放，切回 AI 模式 |
-| reply <chat_id> <消息>	手动发消息（Reply 不可用时的备选） |
+| `/export` | 导出单个客户账单记录为 Excel |
+| `/exportall` | 导出所有客户账单记录为 Excel |
+| takeover <chat_id>  |	手动接管某用户对话 |
+| release <chat_id>  |	释放，切回 AI 模式 |
+| reply <chat_id>  | <消息>	手动发消息（Reply 不可用时的备选） |
 | 自然语言 | 自动识别为客服问答或记账 |
 
 ## 配置说明
@@ -72,10 +73,10 @@ docker compose up -d
 | 环境变量 | 说明 | 默认值/当前配置 |
 |----------|------|-----------------|
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | (必填) |
-| `LLM_PROVIDER` | LLM 服务商 |  (必填)(默认为deepseek,支持接入任意 OpenAI 兼容 API,openai, claude, deepseek等)|
+| `LLM_PROVIDER` | LLM 服务商 |  (必填)(默认为openai,支持接入任意 OpenAI 兼容 API,openai, claude, deepseek等)|
 | `LLM_API_KEY` | LLM API Key | (必填) |
-| `LLM_BASE_URL` | API 地址 |  (必填)`https://api.deepseek.com/v1` |
-| `LLM_MODEL_NAME` | 模型名称 |  (必填)`deepseek-chat` |
+| `LLM_BASE_URL` | API 地址 |  (必填)`https://api.openai.com/v1` |
+| `LLM_MODEL_NAME` | 模型名称 |  (必填)`gpt-4o-mini` |
 | `NOTION_ENABLED` | 启用 Notion 同步 | `false` |
 | `NOTION_API_KEY` | Notion API Key | - |
 | `NOTION_DATABASE_ID` | Notion 数据库 ID | - |

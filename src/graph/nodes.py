@@ -123,6 +123,8 @@ def make_record_transaction(accounting: BaseAccounting):
             quantity=order.get("quantity", 1),
             unit_price=order.get("unit_price", 0),
             total_amount=order.get("total_amount", 0),
+            # [新增] 记录客户名称到交易数据
+            customer_name=order.get("customer_name", ""),
             description=order.get("description", ""),
         )
 
