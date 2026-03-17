@@ -17,6 +17,8 @@ class ContextManager:
         self.expire_minutes = expire_minutes or settings.context_expire_minutes
         # {chat_id: {"messages": [...], "last_active": timestamp}}
         self._sessions: dict[int, dict] = {}
+        # 每个用户的待确认订单状态：{chat_id: order_dict}
+        self.pending_orders: dict[int, dict] = {}
 
     def get_history(self, chat_id: int) -> list[dict[str, str]]:
         session = self._sessions.get(chat_id)
@@ -54,5 +56,17 @@ class ContextManager:
         return len(expired)
 
     def _is_expired(self, session: dict) -> bool:
-        elapsed = time.time() - session["last_active"]
+        elapsed = time.time() - session[“last_active”]
         return elapsed > self.expire_minutes * 60
+
+    # 设置待确认订单
+    def set_pending_order(self, chat_id: int, order: dict) -> None:
+        self.pending_orders[chat_id] = order
+
+    # [新增] 获取待确认订单
+    def get_pending_order(self, chat_id: int) -> dict | None:
+        return self.pending_orders.get(chat_id)
+
+    # [新增] 清除待确认订单（订单完成或取消时调用）
+    def clear_pending_order(self, chat_id: int) -> None:
+        self.pending_orders.pop(chat_id, None)

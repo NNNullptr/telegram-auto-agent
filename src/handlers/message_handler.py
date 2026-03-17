@@ -1,3 +1,4 @@
+#引入各种模块
 import logging
 from io import BytesIO
 from telegram import Update
@@ -29,8 +30,7 @@ _CONFIRM_KEYWORDS = {"确认", "是的", "对", "好的", "确定", "yes", "conf
 
 
 class MessageHandler:
-    """Central message dispatcher: uses LangGraph state machine for routing."""
-
+    """中央消息分发器：使用 LangGraph 状态机进行路由"""
     def __init__(self):
         llm = LLMFactory.create()
 
@@ -94,7 +94,8 @@ class MessageHandler:
 
         # ── 检查是否是待确认订单的确认消息（绕过 classifier） ──
         history = self.context.get_history(chat_id)
-        pending_order = self._check_pending_order(user_message, history)
+        # ⬇️ 换成只传 chat_id 和 user_message
+        pending_order = self._check_pending_order(chat_id, user_message) 
         if pending_order:
             await self._confirm_order(update, context, chat_id, pending_order)
             return
@@ -114,12 +115,20 @@ class MessageHandler:
 
         result = await self.graph.ainvoke(state)
         reply = result.get("response", "Sorry, something went wrong.")
-        confirmed_order = result.get("extracted_order")
+        
+        extracted_order = result.get("extracted_order")
+        is_order_confirmed = result.get("order_confirmed")
 
-        # NOTE: Graph-based confirmation path doesn't go through _confirm_order.
-        # We still need to notify admin and enter manual mode here.
-        if result.get("order_confirmed") and confirmed_order:
-            await self._notify_admin_and_enter_manual(chat_id, confirmed_order, context)
+        # ── 新增的状态机逻辑 ──
+        # 场景 A: AI 给出了订单详情让用户确认，我们把它存入状态机
+        if extracted_order and not is_order_confirmed:
+            self.context.set_pending_order(chat_id, extracted_order)
+            logger.info(f"[{chat_id}] 订单存入待确认状态")
+
+        # 场景 B: 订单在 Graph 中被直接确认了（通常不常见，但为了安全兜底）
+        elif is_order_confirmed and extracted_order:
+            self.context.clear_pending_order(chat_id) # 确认了就清空状态
+            await self._notify_admin_and_enter_manual(chat_id, extracted_order, context)
 
         # 如果自动升级到 manual，通知 admin
         if result.get("intent") == "manual" and settings.admin_id:
@@ -142,46 +151,21 @@ class MessageHandler:
         await update.message.reply_text(reply)
         logger.info(f"[{chat_id}] Intent: {result.get('intent')} | Replied: {reply[:80]}...")
 
-    def _check_pending_order(
-        self, user_message: str, history: list[dict[str, str]]
-    ) -> dict | None:
-        """检查：上一条 assistant 消息是否包含「确认订单」，且用户回复了确认关键词。"""
-        if not history:
-            return None
-        msg_lower = user_message.strip().lower()
-        if not any(kw in msg_lower for kw in _CONFIRM_KEYWORDS):
-            return None
-        for msg in reversed(history):
-            if msg.get("role") == "assistant" and "确认订单" in msg.get("content", ""):
-                return self._parse_order_from_confirmation(msg["content"])
-        return None
-
-    @staticmethod
-    def _parse_order_from_confirmation(content: str) -> dict | None:
-        """从确认消息文本中解析订单信息。
-
-        [修改] 新增解析 '客户：' 行以提取 customer_name。
+    def _check_pending_order(self, chat_id: int, user_message: str) -> dict | None:
         """
-        try:
-            order = {}
-            for line in content.split("\n"):
-                # [新增] 解析客户名称
-                if "客户：" in line:
-                    order["customer_name"] = line.split("客户：")[1].strip()
-                elif "商品：" in line:
-                    order["product"] = line.split("商品：")[1].strip()
-                elif "数量：" in line:
-                    order["quantity"] = int(line.split("数量：")[1].strip())
-                elif "单价：¥" in line:
-                    order["unit_price"] = float(line.split("单价：¥")[1].strip())
-                elif "总计：¥" in line:
-                    order["total_amount"] = float(line.split("总计：¥")[1].strip())
-            if "product" in order and "total_amount" in order:
-                order.setdefault("quantity", 1)
-                order.setdefault("unit_price", order["total_amount"])
-                return order
-        except (ValueError, IndexError):
-            pass
+        [重构] 检查是否存在待确认的订单状态。
+        不再依赖历史记录的文本解析，而是直接从 ContextManager 中获取结构化字典。
+        """
+        # 1. 从状态机获取该用户是否有待确认的订单字典
+        pending_order = self.context.get_pending_order(chat_id)
+        if not pending_order:
+            return None
+
+        # 2. 检查用户是否回复了确认关键词
+        msg_lower = user_message.strip().lower()
+        if any(kw in msg_lower for kw in _CONFIRM_KEYWORDS):
+            return pending_order
+            
         return None
 
     async def _confirm_order(
@@ -220,6 +204,8 @@ class MessageHandler:
         self.context.add_message(chat_id, "user", update.message.text)
         self.context.add_message(chat_id, "assistant", reply)
         await update.message.reply_text(reply)
+
+        self.context.clear_pending_order(chat_id)
 
         # 3. 通知 admin + 进入 manual 模式
         await self._notify_admin_and_enter_manual(chat_id, order, context)
