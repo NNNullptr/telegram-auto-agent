@@ -7,6 +7,9 @@ Flow:
   4. /takeover <chat_id> — 手动接管
   5. /release <chat_id> — 释放，切回 AI
   6. /reply <chat_id> <消息> — 手动回复（Reply 不可用时的备选）
+
+[修复] release 时同步清空对话历史 + pending_orders + 持久化 manual mode，
+       避免旧订单上下文污染后续 AI 对话（第二次交易幻觉的根因）。
 """
 
 import logging
@@ -17,6 +20,11 @@ from config import settings
 from src.graph.nodes import set_manual_mode
 
 logger = logging.getLogger(__name__)
+
+
+def _get_handler(context: ContextTypes.DEFAULT_TYPE):
+    """从 bot_data 获取 MessageHandler 实例（可能为 None）。"""
+    return context.application.bot_data.get("handler")
 
 
 def _is_admin(user_id: int) -> bool:
@@ -63,6 +71,21 @@ async def handle_release(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     set_manual_mode(target, False)
+
+    # ── [修复] 释放时清理所有残留状态，防止旧上下文污染 AI 新对话 ──
+    handler = _get_handler(context)
+    if handler:
+        # 1. 清空对话历史：这是第二次交易幻觉的根因
+        #    旧历史中包含第一次订单的完整对话（商品名、价格、确认、客户名等），
+        #    LLM 在处理新消息时会混淆新旧订单数据
+        handler.context.clear(target)
+        # 2. 清除可能残留的待确认订单（内存 + DB）
+        handler.context.clear_pending_order(target)
+        await handler.db.delete_pending_order(target)
+        # 3. 持久化 manual mode = False 到数据库
+        #    原实现只改了内存，bot 重启后用户会被误恢复为 manual 模式
+        await handler.db.save_manual_mode(target, False)
+
     await update.message.reply_text(f"✅ 已释放用户 {target}，切回 AI 模式。")
 
     try:
@@ -102,6 +125,12 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         await context.bot.send_message(chat_id=target_chat_id, text=msg.text)
+        # [修复] admin 回复也写入上下文，保持对话历史对称
+        # 原实现中 _forward_to_admin 会写入 user 消息，但 admin 回复不写入，
+        # 导致 LLM 看到的历史是单边的（用户说话但无回复），加剧幻觉
+        handler = _get_handler(context)
+        if handler:
+            handler.context.add_message(target_chat_id, "assistant", msg.text)
         await msg.reply_text(f"✅ 已发送给用户 {target_chat_id}")
     except Exception as e:
         logger.error(f"Failed to reply to user {target_chat_id}: {e}")
@@ -138,6 +167,10 @@ async def handle_manual_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = " ".join(args[1:])
     try:
         await context.bot.send_message(chat_id=target, text=text)
+        # [修复] 手动回复也同步写入上下文，与 handle_admin_reply 保持一致
+        handler = _get_handler(context)
+        if handler:
+            handler.context.add_message(target, "assistant", text)
         await update.message.reply_text(f"✅ 已发送给 {target}")
     except Exception as e:
         await update.message.reply_text(f"❌ 发送失败：{e}")

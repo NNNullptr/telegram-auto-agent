@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,17 @@ class Database:
                     chat_id INTEGER PRIMARY KEY,
                     is_manual INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
+                )
+            """)
+            # [新增] pending_orders 表：持久化用户待确认订单，bot 重启后可恢复
+            # chat_id: 用户会话 ID（主键，每用户最多一条待确认订单）
+            # order_json: 订单字典序列化为 JSON 字符串
+            # created_at: 订单创建时间，用于过期清理
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_orders (
+                    chat_id INTEGER PRIMARY KEY,
+                    order_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 )
             """)
             # [新增] 兼容旧数据库：如果 transactions 表已存在但缺少 customer_name 列，自动添加
@@ -125,6 +137,56 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to load manual modes: {e}")
         return result
+
+    # --- Pending order persistence ---
+
+    async def save_pending_order(self, chat_id: int, order: dict) -> None:
+        """将待确认订单序列化后写入数据库，bot 重启后可恢复。
+
+        使用 INSERT OR REPLACE（ON CONFLICT）保证每个用户只保留最新一条待确认订单。
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    INSERT INTO pending_orders (chat_id, order_json, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        order_json = excluded.order_json,
+                        created_at = excluded.created_at
+                    """,
+                    (chat_id, json.dumps(order, ensure_ascii=False), datetime.now().isoformat()),
+                )
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save pending order for {chat_id}: {e}")
+
+    async def load_pending_orders(self) -> dict[int, dict]:
+        """启动时从数据库恢复所有待确认订单，返回 {chat_id: order_dict}。"""
+        result: dict[int, dict] = {}
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT chat_id, order_json FROM pending_orders")
+                rows = await cursor.fetchall()
+                for row in rows:
+                    try:
+                        result[row["chat_id"]] = json.loads(row["order_json"])
+                    except json.JSONDecodeError as e:
+                        # 数据损坏时跳过该条记录，避免阻断启动流程
+                        logger.warning(f"Skipping corrupt pending order for {row['chat_id']}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load pending orders: {e}")
+        return result
+
+    async def delete_pending_order(self, chat_id: int) -> None:
+        """订单确认或取消后，从数据库删除对应待确认记录。"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("DELETE FROM pending_orders WHERE chat_id = ?", (chat_id,))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to delete pending order for {chat_id}: {e}")
 
     async def save_manual_mode(self, chat_id: int, is_manual: bool) -> None:
         try:

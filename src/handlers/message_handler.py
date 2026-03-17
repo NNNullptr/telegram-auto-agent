@@ -25,8 +25,11 @@ from src.graph.nodes import is_manual_mode, set_manual_mode
 
 logger = logging.getLogger(__name__)
 
-# 确认关键词（和 purchasing.py 保持一致）
+# 确认关键词：用户回复这些词时视为同意下单（和 purchasing.py 保持一致）
 _CONFIRM_KEYWORDS = {"确认", "是的", "对", "好的", "确定", "yes", "confirm", "ok", "sure", "y"}
+
+# 取消关键词：用户回复这些词时视为放弃待确认订单
+_CANCEL_KEYWORDS = {"取消", "不要", "不用", "算了", "不下了", "cancel", "no", "nope", "n"}
 
 
 class MessageHandler:
@@ -73,11 +76,20 @@ class MessageHandler:
 
     async def init(self) -> None:
         await self.db.init()
+
+        # 恢复 manual 模式状态
         modes = await self.db.load_manual_modes()
         for chat_id, enabled in modes.items():
             set_manual_mode(chat_id, enabled)
         if modes:
             logger.info(f"Restored {len(modes)} manual mode sessions")
+
+        # [新增] 恢复待确认订单状态：bot 重启后用户的待确认订单不会丢失
+        pending_orders = await self.db.load_pending_orders()
+        for chat_id, order in pending_orders.items():
+            self.context.set_pending_order(chat_id, order)
+        if pending_orders:
+            logger.info(f"Restored {len(pending_orders)} pending orders")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message or not update.message.text:
@@ -92,15 +104,20 @@ class MessageHandler:
             await self._forward_to_admin(update, chat_id, user_message, context)
             return
 
-        # ── 检查是否是待确认订单的确认消息（绕过 classifier） ──
-        history = self.context.get_history(chat_id)
-        # ⬇️ 换成只传 chat_id 和 user_message
-        pending_order = self._check_pending_order(chat_id, user_message) 
+        # ── 待确认订单状态机（优先于 classifier，避免误分类） ──
+        # 先检查取消，再检查确认，两者均无需调用 LangGraph 节省开销
+        if self._check_cancel_order(chat_id, user_message):
+            await self._cancel_order(update, context, chat_id)
+            return
+
+        pending_order = self._check_pending_order(chat_id, user_message)
         if pending_order:
             await self._confirm_order(update, context, chat_id, pending_order)
             return
 
         # ── 正常流程：invoke LangGraph ──
+        # history 仅在进入 LangGraph 时才需要，延迟到此处获取
+        history = self.context.get_history(chat_id)
         state = {
             "chat_id": chat_id,
             "user_message": user_message,
@@ -119,15 +136,19 @@ class MessageHandler:
         extracted_order = result.get("extracted_order")
         is_order_confirmed = result.get("order_confirmed")
 
-        # ── 新增的状态机逻辑 ──
-        # 场景 A: AI 给出了订单详情让用户确认，我们把它存入状态机
+        # ── 状态机逻辑 ──
+        # 场景 A: AI 解析出订单但尚未确认，存入状态机等待用户回复
         if extracted_order and not is_order_confirmed:
             self.context.set_pending_order(chat_id, extracted_order)
-            logger.info(f"[{chat_id}] 订单存入待确认状态")
+            # [新增] 同步写入数据库，防止 bot 重启后订单丢失
+            await self.db.save_pending_order(chat_id, extracted_order)
+            logger.info(f"[{chat_id}] 订单存入待确认状态（已持久化）")
 
-        # 场景 B: 订单在 Graph 中被直接确认了（通常不常见，但为了安全兜底）
+        # 场景 B: 订单在 Graph 内部被直接确认（安全兜底，一般不触发）
         elif is_order_confirmed and extracted_order:
-            self.context.clear_pending_order(chat_id) # 确认了就清空状态
+            self.context.clear_pending_order(chat_id)
+            # [新增] 同步删除数据库记录
+            await self.db.delete_pending_order(chat_id)
             await self._notify_admin_and_enter_manual(chat_id, extracted_order, context)
 
         # 如果自动升级到 manual，通知 admin
@@ -152,21 +173,45 @@ class MessageHandler:
         logger.info(f"[{chat_id}] Intent: {result.get('intent')} | Replied: {reply[:80]}...")
 
     def _check_pending_order(self, chat_id: int, user_message: str) -> dict | None:
+        """检查用户是否在回复确认关键词，且当前存在待确认订单。
+
+        直接从 ContextManager 获取结构化订单字典，不再做文本解析。
+        过期订单由 ContextManager 惰性清理，此处无需处理。
         """
-        [重构] 检查是否存在待确认的订单状态。
-        不再依赖历史记录的文本解析，而是直接从 ContextManager 中获取结构化字典。
-        """
-        # 1. 从状态机获取该用户是否有待确认的订单字典
         pending_order = self.context.get_pending_order(chat_id)
         if not pending_order:
             return None
-
-        # 2. 检查用户是否回复了确认关键词
         msg_lower = user_message.strip().lower()
         if any(kw in msg_lower for kw in _CONFIRM_KEYWORDS):
             return pending_order
-            
         return None
+
+    def _check_cancel_order(self, chat_id: int, user_message: str) -> bool:
+        """检查用户是否在回复取消关键词，且当前存在待确认订单。
+
+        取消检查优先于确认检查执行，防止模糊词义被误判为确认。
+        """
+        if not self.context.get_pending_order(chat_id):
+            return False
+        msg_lower = user_message.strip().lower()
+        return any(kw in msg_lower for kw in _CANCEL_KEYWORDS)
+
+    async def _cancel_order(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+    ) -> None:
+        """处理订单取消：清除内存状态 → 删除 DB 记录 → 回复用户。"""
+        self.context.clear_pending_order(chat_id)
+        # 同步删除数据库中的待确认记录
+        await self.db.delete_pending_order(chat_id)
+
+        reply = "好的，已取消本次订单。如需重新下单，请随时告诉我。"
+        self.context.add_message(chat_id, "user", update.message.text)
+        self.context.add_message(chat_id, "assistant", reply)
+        await update.message.reply_text(reply)
+        logger.info(f"[{chat_id}] 用户主动取消待确认订单")
 
     async def _confirm_order(
         self,
@@ -206,6 +251,8 @@ class MessageHandler:
         await update.message.reply_text(reply)
 
         self.context.clear_pending_order(chat_id)
+        # [新增] 订单确认后同步删除数据库中的待确认记录
+        await self.db.delete_pending_order(chat_id)
 
         # 3. 通知 admin + 进入 manual 模式
         await self._notify_admin_and_enter_manual(chat_id, order, context)
@@ -252,17 +299,21 @@ class MessageHandler:
         user_message: str,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """manual 模式下转发用户消息给 admin。"""
+        """manual 模式下转发用户消息给 admin。
+
+        [修复] 用户消息仍写入上下文（admin_handler 中 admin 回复也会写入），
+        保持对话历史完整对称。release 时会统一清空，所以不会污染后续 AI 对话。
+        """
         text = f"💬 [用户 {chat_id}]\n{user_message}"
         try:
             sent = await context.bot.send_message(
                 chat_id=settings.admin_id, text=text
             )
             self.forwarded_map[sent.message_id] = chat_id
+            # [修复] 每次插入后若超过上限，只移除最旧的一条（FIFO）
             if len(self.forwarded_map) > 500:
-                oldest_keys = list(self.forwarded_map.keys())[:-500]
-                for k in oldest_keys:
-                    del self.forwarded_map[k]
+                oldest_key = next(iter(self.forwarded_map))
+                del self.forwarded_map[oldest_key]
         except Exception as e:
             logger.error(f"Failed to forward to admin: {e}")
 

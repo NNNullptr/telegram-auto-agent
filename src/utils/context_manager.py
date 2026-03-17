@@ -1,4 +1,4 @@
-import time
+﻿import time
 import logging
 from config import settings
 
@@ -6,7 +6,14 @@ logger = logging.getLogger(__name__)
 
 
 class ContextManager:
-    """Manages multi-turn conversation history per chat_id."""
+    """管理每个 chat_id 的多轮对话历史。
+
+    同时维护每个用户的待确认订单状态（pending_orders），
+    订单超过 PENDING_ORDER_TTL 秒后自动过期，避免临时订单堆积内存。
+    """
+
+    # 待确认订单的存活时长（秒），超时后 get_pending_order 返回 None 并自动清理
+    PENDING_ORDER_TTL: int = 30 * 60  # 30 分钟
 
     def __init__(
         self,
@@ -17,8 +24,10 @@ class ContextManager:
         self.expire_minutes = expire_minutes or settings.context_expire_minutes
         # {chat_id: {"messages": [...], "last_active": timestamp}}
         self._sessions: dict[int, dict] = {}
-        # 每个用户的待确认订单状态：{chat_id: order_dict}
-        self.pending_orders: dict[int, dict] = {}
+        # 待确认订单状态，内部结构为：
+        # {chat_id: {"order": dict, "expires_at": float(unix timestamp)}}
+        # 通过公开方法访问，外部仅感知 dict | None
+        self._pending_orders: dict[int, dict] = {}
 
     def get_history(self, chat_id: int) -> list[dict[str, str]]:
         session = self._sessions.get(chat_id)
@@ -56,17 +65,28 @@ class ContextManager:
         return len(expired)
 
     def _is_expired(self, session: dict) -> bool:
-        elapsed = time.time() - session[“last_active”]
+        elapsed = time.time() - session["last_active"]
         return elapsed > self.expire_minutes * 60
 
-    # 设置待确认订单
     def set_pending_order(self, chat_id: int, order: dict) -> None:
-        self.pending_orders[chat_id] = order
+        """存入待确认订单，并记录过期时间（当前时间 + PENDING_ORDER_TTL）。"""
+        self._pending_orders[chat_id] = {
+            "order": order,
+            "expires_at": time.time() + self.PENDING_ORDER_TTL,
+        }
 
-    # [新增] 获取待确认订单
     def get_pending_order(self, chat_id: int) -> dict | None:
-        return self.pending_orders.get(chat_id)
+        """获取待确认订单；若已过期则自动清除并返回 None。"""
+        entry = self._pending_orders.get(chat_id)
+        if not entry:
+            return None
+        if time.time() > entry["expires_at"]:
+            # 订单超时，惰性清理（lazy cleanup），无需定时任务
+            self._pending_orders.pop(chat_id, None)
+            logger.info(f"[{chat_id}] Pending order expired and auto-cleared")
+            return None
+        return entry["order"]
 
-    # [新增] 清除待确认订单（订单完成或取消时调用）
     def clear_pending_order(self, chat_id: int) -> None:
-        self.pending_orders.pop(chat_id, None)
+        """订单确认或取消时主动清除。"""
+        self._pending_orders.pop(chat_id, None)
