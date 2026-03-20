@@ -14,7 +14,8 @@ EXCEL_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 class ExcelAccounting(BaseAccounting):
     """Excel file-backed accounting — appends transactions to a local .xlsx."""
 
-    HEADERS = ["Date", "Product", "Quantity", "UnitPrice", "TotalAmount", "Description"]
+    # [修复] 新增 CustomerName 列，与 SQLite/Notion 字段对齐
+    HEADERS = ["Date", "Product", "Quantity", "UnitPrice", "TotalAmount", "CustomerName", "Description"]
 
     def __init__(self, export_dir: Path | None = None):
         self.export_dir = export_dir or EXCEL_DIR
@@ -43,7 +44,9 @@ class ExcelAccounting(BaseAccounting):
             ws.cell(row=row, column=3, value=transaction.quantity)
             ws.cell(row=row, column=4, value=transaction.unit_price)
             ws.cell(row=row, column=5, value=transaction.total_amount)
-            ws.cell(row=row, column=6, value=transaction.description)
+            # [修复] 写入客户名称
+            ws.cell(row=row, column=6, value=transaction.customer_name or "")
+            ws.cell(row=row, column=7, value=transaction.description)
 
             wb.save(path)
             logger.info(f"Excel: appended transaction to {path}")
@@ -69,7 +72,9 @@ class ExcelAccounting(BaseAccounting):
                     quantity=int(row[2] or 1),
                     unit_price=float(row[3] or 0),
                     total_amount=float(row[4] or 0),
-                    description=str(row[5] or ""),
+                    # [修复] 读取客户名称（兼容旧文件：列可能不存在）
+                    customer_name=str(row[5] or "") if len(row) > 6 else "",
+                    description=str(row[6] or "") if len(row) > 6 else str(row[5] or ""),
                 ))
             return transactions
         except Exception as e:

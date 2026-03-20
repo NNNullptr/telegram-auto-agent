@@ -161,19 +161,27 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to save pending order for {chat_id}: {e}")
 
-    async def load_pending_orders(self) -> dict[int, dict]:
-        """启动时从数据库恢复所有待确认订单，返回 {chat_id: order_dict}。"""
-        result: dict[int, dict] = {}
+    async def load_pending_orders(self) -> dict[int, tuple[dict, str]]:
+        """启动时从数据库恢复所有待确认订单。
+
+        返回 {chat_id: (order_dict, created_at_iso)}，
+        调用方需根据 created_at 计算剩余 TTL，避免过期订单被错误复活。
+        """
+        result: dict[int, tuple[dict, str]] = {}
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
-                cursor = await db.execute("SELECT chat_id, order_json FROM pending_orders")
+                cursor = await db.execute(
+                    "SELECT chat_id, order_json, created_at FROM pending_orders"
+                )
                 rows = await cursor.fetchall()
                 for row in rows:
                     try:
-                        result[row["chat_id"]] = json.loads(row["order_json"])
+                        result[row["chat_id"]] = (
+                            json.loads(row["order_json"]),
+                            row["created_at"],
+                        )
                     except json.JSONDecodeError as e:
-                        # 数据损坏时跳过该条记录，避免阻断启动流程
                         logger.warning(f"Skipping corrupt pending order for {row['chat_id']}: {e}")
         except Exception as e:
             logger.error(f"Failed to load pending orders: {e}")

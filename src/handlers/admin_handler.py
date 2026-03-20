@@ -47,6 +47,11 @@ async def handle_takeover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     set_manual_mode(target, True)
+    # [修复] 持久化 manual mode 到数据库，防止 bot 重启后状态丢失
+    handler = _get_handler(context)
+    if handler:
+        await handler.db.save_manual_mode(target, True)
+
     await update.message.reply_text(f"✅ 已接管用户 {target}，用户消息会转发给你。")
 
     try:
@@ -109,7 +114,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     replied_id = replied_to.message_id
 
     # 从 forwarded_map 查找原用户
-    handler = context.application.bot_data.get("handler")
+    handler = _get_handler(context)
     if not handler:
         return
 
@@ -126,11 +131,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         await context.bot.send_message(chat_id=target_chat_id, text=msg.text)
         # [修复] admin 回复也写入上下文，保持对话历史对称
-        # 原实现中 _forward_to_admin 会写入 user 消息，但 admin 回复不写入，
-        # 导致 LLM 看到的历史是单边的（用户说话但无回复），加剧幻觉
-        handler = _get_handler(context)
-        if handler:
-            handler.context.add_message(target_chat_id, "assistant", msg.text)
+        handler.context.add_message(target_chat_id, "assistant", msg.text)
         await msg.reply_text(f"✅ 已发送给用户 {target_chat_id}")
     except Exception as e:
         logger.error(f"Failed to reply to user {target_chat_id}: {e}")

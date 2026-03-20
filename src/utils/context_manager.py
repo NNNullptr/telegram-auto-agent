@@ -68,11 +68,18 @@ class ContextManager:
         elapsed = time.time() - session["last_active"]
         return elapsed > self.expire_minutes * 60
 
-    def set_pending_order(self, chat_id: int, order: dict) -> None:
-        """存入待确认订单，并记录过期时间（当前时间 + PENDING_ORDER_TTL）。"""
+    def set_pending_order(self, chat_id: int, order: dict, expires_at: float | None = None) -> None:
+        """存入待确认订单。
+
+        Args:
+            chat_id: 用户会话 ID
+            order: 订单字典
+            expires_at: 可选的过期时间戳。不传则按 now + TTL 计算。
+                        从 DB 恢复时传入基于 created_at 计算的精确值。
+        """
         self._pending_orders[chat_id] = {
             "order": order,
-            "expires_at": time.time() + self.PENDING_ORDER_TTL,
+            "expires_at": expires_at if expires_at is not None else time.time() + self.PENDING_ORDER_TTL,
         }
 
     def get_pending_order(self, chat_id: int) -> dict | None:

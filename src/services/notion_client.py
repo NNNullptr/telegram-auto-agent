@@ -11,6 +11,9 @@ class NotionService:
 
     def __init__(self):
         self.enabled = settings.notion_enabled
+        # [修复] 先设置默认值，避免 enabled=False 时访问 client/database_id 抛 AttributeError
+        self.client = None
+        self.database_id = ""
         if self.enabled:
             self.client = AsyncClient(auth=settings.notion_api_key)
             self.database_id = settings.notion_database_id

@@ -8,7 +8,20 @@ logger = logging.getLogger(__name__)
 
 
 class NotionAccounting(BaseAccounting):
-    """Notion-backed accounting implementation."""
+    """Notion-backed accounting implementation.
+
+    将交易记录同步到 Notion 数据库。要求 Notion 数据库包含以下属性：
+    - Product (title): 商品名称
+    - Quantity (number): 数量
+    - UnitPrice (number): 单价
+    - TotalAmount (number): 总金额
+    - CustomerName (rich_text): 客户名称
+    - ChatId (number): 用户会话 ID
+    - Description (rich_text): 备注
+    - Date (date): 订单日期
+
+    [修复] 原实现缺少 CustomerName 和 ChatId，导致 Notion 中无法识别客户。
+    """
 
     def __init__(self, notion_service: NotionService):
         self.notion = notion_service
@@ -26,6 +39,11 @@ class NotionAccounting(BaseAccounting):
                     "Quantity": {"number": transaction.quantity},
                     "UnitPrice": {"number": transaction.unit_price},
                     "TotalAmount": {"number": transaction.total_amount},
+                    # [修复] 新增客户名称和会话 ID，与 SQLite 存储字段对齐
+                    "CustomerName": {
+                        "rich_text": [{"text": {"content": transaction.customer_name or ""}}]
+                    },
+                    "ChatId": {"number": transaction.chat_id},
                     "Description": {
                         "rich_text": [{"text": {"content": transaction.description}}]
                     },

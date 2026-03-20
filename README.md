@@ -1,4 +1,3 @@
-正在完善中
 # telegram-auto-agent
 
 基于 LLM 的 Telegram 智能 Agent，支持自动客服回复与记账。

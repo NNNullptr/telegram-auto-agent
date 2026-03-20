@@ -26,6 +26,7 @@ from src.graph.nodes import is_manual_mode, set_manual_mode
 logger = logging.getLogger(__name__)
 
 # 确认关键词：用户回复这些词时视为同意下单（和 purchasing.py 保持一致）
+# [修复] 使用精确匹配（整条消息 == 关键词），防止 "确定不要" 误触发确认
 _CONFIRM_KEYWORDS = {"确认", "是的", "对", "好的", "确定", "yes", "confirm", "ok", "sure", "y"}
 
 # 取消关键词：用户回复这些词时视为放弃待确认订单
@@ -72,6 +73,16 @@ class MessageHandler:
             backends.append(ExcelAccounting())
         if not backends:
             backends.append(SQLiteAccounting(self.db))
+
+        # [新增] 配置冲突检测：NOTION_ENABLED=true 但 ACCOUNTING_BACKENDS 中没有 notion
+        # 这是常见的配置遗漏，原来完全静默导致极难排查
+        if settings.notion_enabled and "notion" not in enabled:
+            logger.warning(
+                "⚠️ NOTION_ENABLED=true 但 ACCOUNTING_BACKENDS 中未包含 'notion'，"
+                "订单将不会同步到 Notion！请在 .env 中设置 ACCOUNTING_BACKENDS=sqlite,notion"
+            )
+
+        logger.info(f"Accounting backends: {[type(b).__name__ for b in backends]}")
         return CompositeAccounting(backends)
 
     async def init(self) -> None:
@@ -84,12 +95,33 @@ class MessageHandler:
         if modes:
             logger.info(f"Restored {len(modes)} manual mode sessions")
 
-        # [新增] 恢复待确认订单状态：bot 重启后用户的待确认订单不会丢失
+        # [修复] 恢复待确认订单：根据 DB 中的 created_at 计算正确的剩余 TTL
+        # 原实现直接调用 set_pending_order → 获得全新的 30 分钟 TTL，
+        # 导致已过期的订单在重启后被错误复活
+        from datetime import datetime as _dt
         pending_orders = await self.db.load_pending_orders()
-        for chat_id, order in pending_orders.items():
-            self.context.set_pending_order(chat_id, order)
-        if pending_orders:
-            logger.info(f"Restored {len(pending_orders)} pending orders")
+        expired_count = 0
+        for chat_id, (order, created_at_iso) in pending_orders.items():
+            try:
+                created_at = _dt.fromisoformat(created_at_iso)
+                age_seconds = (_dt.now() - created_at).total_seconds()
+                remaining = self.context.PENDING_ORDER_TTL - age_seconds
+                if remaining <= 0:
+                    # 已过期，从 DB 中也清理掉
+                    await self.db.delete_pending_order(chat_id)
+                    expired_count += 1
+                    continue
+                # 按正确的剩余时间设置过期
+                import time as _time
+                self.context.set_pending_order(chat_id, order, expires_at=_time.time() + remaining)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Skipping pending order for {chat_id}: bad created_at: {e}")
+                await self.db.delete_pending_order(chat_id)
+        restored = len(pending_orders) - expired_count
+        if restored:
+            logger.info(f"Restored {restored} pending orders")
+        if expired_count:
+            logger.info(f"Cleaned up {expired_count} expired pending orders from DB")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message or not update.message.text:
@@ -181,8 +213,10 @@ class MessageHandler:
         pending_order = self.context.get_pending_order(chat_id)
         if not pending_order:
             return None
+        # [修复] 精确匹配：整条消息必须是关键词本身，而非子串包含
+        # 防止 "确定不要"、"我不确定" 等复合语句误触发
         msg_lower = user_message.strip().lower()
-        if any(kw in msg_lower for kw in _CONFIRM_KEYWORDS):
+        if msg_lower in _CONFIRM_KEYWORDS:
             return pending_order
         return None
 
@@ -193,8 +227,9 @@ class MessageHandler:
         """
         if not self.context.get_pending_order(chat_id):
             return False
+        # [修复] 同样使用精确匹配
         msg_lower = user_message.strip().lower()
-        return any(kw in msg_lower for kw in _CANCEL_KEYWORDS)
+        return msg_lower in _CANCEL_KEYWORDS
 
     async def _cancel_order(
         self,
@@ -231,19 +266,21 @@ class MessageHandler:
             quantity=order.get("quantity", 1),
             unit_price=order.get("unit_price", 0),
             total_amount=order.get("total_amount", 0),
-            # [新增] 记录客户名称
             customer_name=order.get("customer_name", ""),
+            # [修复] 补上 description，原实现丢失了 LLM 提取的订单备注
+            description=order.get("description", ""),
         )
         record_id = await self.accounting.record_transaction(transaction)
         logger.info(f"[{chat_id}] Transaction recorded: {record_id}")
 
         # 2. 回复用户（[修改] 增加客户名称显示）
         customer = order.get("customer_name", "")
+        # [修复] 使用 .get() 防止 KeyError
         reply = (
             f"✅ 订单已确认！\n"
             + (f"👤 客户：{customer}\n" if customer else "")
-            + f"📦 {order['product']} x{order.get('quantity', 1)}\n"
-            f"💰 总计 ¥{order['total_amount']:.2f}\n"
+            + f"📦 {order.get('product', '未知商品')} x{order.get('quantity', 1)}\n"
+            f"💰 总计 ¥{order.get('total_amount', 0):.2f}\n"
             f"正在为您转接人工客服确认详情..."
         )
         self.context.add_message(chat_id, "user", update.message.text)
