@@ -1,6 +1,7 @@
 # telegram-auto-agent
 
 基于 LLM 的 Telegram 智能 Agent，支持自动客服回复与记账。
+[小白使用教程](https://www.notion.so/telegram-auto-agent-33c99de2521a80ce83beeac31df56f9b?source=copy_link)
 
 ## 功能特性
 
